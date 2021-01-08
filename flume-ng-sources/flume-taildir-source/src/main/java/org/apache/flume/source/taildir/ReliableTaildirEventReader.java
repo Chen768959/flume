@@ -80,7 +80,16 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
               new Object[]{ReliableTaildirEventReader.class.getSimpleName(), filePaths});
     }
 
+    //taildirCache中保存了每个filegroup的真实路径，和其对应的文件正则规则
     List<TailMatcher> taildirCache = Lists.newArrayList();
+
+    /**
+     * 每一个TaildirMatcher，与一个配置文件中的一个group对应，
+     * 它包含了group对应的目录与正则，其作用是根据正则与路径，找到目录下所有符合条件的文件
+     * 且包含缓存机制。
+     *
+     * 此处根据配置文件中的group数，创建对应对象
+     */
     if (filePaths != null) {
       for (Entry<String, String> e : filePaths.entrySet()) {
         taildirCache.add(new TaildirMatcher(e.getKey(), e.getValue(), cachePatternMatching));
@@ -102,15 +111,31 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
     this.cachePatternMatching = cachePatternMatching;
     this.annotateFileName = annotateFileName;
     this.fileNameHeader = fileNameHeader;
+
+    /**
+     * 检查filegroup目录里的文件是否有变动，如果有，则更新tailFiles列表
+     * tailFiles列表中装了所有监控的文件信息
+     *
+     * 在第一次加载，也就是本次，会将每个filegroup中，符合正则的所有文件都加载进tailFiles
+     */
     updateTailFiles(skipToEnd);
 
     logger.info("Updating position from position file: " + positionFilePath);
     loadPositionFile(positionFilePath);
+
+    /**
+     * 所以此构造方法一共做了以下几件事
+     * 1、根据配置文件，将每个filegroup路径和其正则表达式封装起来，并将所有封装结果装入taildirCache
+     * 2、根据taildirCache，将每个filegroup中，符合正则的所有文件都加载进tailFiles
+     * 3、根据“读取位置记录文件”，将tailFiles中所有文件的“上一次读取位置”更新进每个文件，然后更新tailFiles。
+     * 此时tailFiles中包含了所有待监控的文件，且每个里面都有自己的上次读取位置。
+     */
   }
 
   /**
    * Load a position file which has the last read position of each file.
    * If the position file exists, update tailFiles mapping.
+   * 加载每个文件的最后读取位置（注意，这个加载的是“位置文件”中的每个文件）
    */
   public void loadPositionFile(String filePath) {
     Long inode, pos;
@@ -119,6 +144,7 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
     JsonReader jr = null;
     try {
       fr = new FileReader(filePath);
+      //positionFilePath为json格式
       jr = new JsonReader(fr);
       jr.beginArray();
       while (jr.hasNext()) {
@@ -146,6 +172,7 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
               + "inode: " + inode + ", pos: " + pos + ", path: " + path);
         }
         TailFile tf = tailFiles.get(inode);
+        //更新每个文件的最后读取pos位置
         if (tf != null && tf.updatePos(path, inode, pos)) {
           tailFiles.put(inode, tf);
         } else {
@@ -197,6 +224,11 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
 
   public List<Event> readEvents(int numEvents, boolean backoffWithoutNL)
       throws IOException {
+    /**
+     * committed默认值为true，所以一开始不会走到这，
+     * 当需要提交，但是由于channel满了等原因没提交成功时，会走到这个地方，
+     * 如果有未提交的任务,代表之前的任务失败了,进行回滚操作.即将上一次
+     */
     if (!committed) {
       if (currentFile == null) {
         throw new IllegalStateException("current file does not exist. ");
@@ -205,11 +237,13 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
       long lastPos = currentFile.getPos();
       currentFile.updateFilePos(lastPos);
     }
+    //从当前文件中读取“每行（按字节读取，读到换行符则返回byte数组）”，将此次读取的初始文件位置存入event的header中
     List<Event> events = currentFile.readEvents(numEvents, backoffWithoutNL, addByteOffset);
     if (events.isEmpty()) {
       return events;
     }
 
+    //读取配置文件中headers.参数，将headerKey加入event的header中
     Map<String, String> headers = currentFile.getHeaders();
     if (annotateFileName || (headers != null && !headers.isEmpty())) {
       for (Event event : events) {
@@ -246,29 +280,52 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
   /**
    * Update tailFiles mapping if a new file is created or appends are detected
    * to the existing file.
+   * 判断filegroup目录下的文件是否有更新，如果有更新则将文件的状态值设置为"已更新"，并返回所有文件的inode号码。
+   * 注意，所有的filegroup是从缓存变量taildirCache中获取的
+   * 在初始化时会，第一次调用该方法。
+   * 运行过程中会不断定时调用该方法。
    */
   public List<Long> updateTailFiles(boolean skipToEnd) throws IOException {
     updateTime = System.currentTimeMillis();
     List<Long> updatedInodes = Lists.newArrayList();
 
+    /**
+     * taildirCache中装的是每个filegroup的根路径，和其正则规则（封装进TaildirMatcher对象）
+     * 此步骤实际上是迭代每个filegroup路径
+     */
     for (TailMatcher taildir : taildirCache) {
       Map<String, String> headers = headerTable.row(taildir.getFileGroup());
 
       for (File f : taildir.getMatchingFiles()) {
         long inode;
         try {
+          //获取文件inode号码（linux系统通过inode号码来识别文件）
           inode = getInode(f);
         } catch (NoSuchFileException e) {
           taildir.deleteFileCache(f);
           logger.info("File has been deleted in the meantime: " + e.getMessage());
           continue;
         }
+        /**
+         * 在start方法时，tailFiles已经第一次装满了所有正则出来的文件对象。
+         * 所以只要不是新建的文件inode，都能在tailFiles中找到tf，
+         * 如果是新建文件，则将pos读取位置设为0（即该文件的初始位置）。
+         * 如果是旧文件，则判断文件是否被修改，如果被修改，则更新该文件的修改标示为“被修改”。
+         *
+         * 不管是不是新建，或有没有修改，都会被重新更新进tailFiles，并将其inode返回。
+         *
+         * 也就是说，每调用一次该方法，都会重新扫描一遍各filegroup路径下符合规则的文件，并返回出去
+         */
         TailFile tf = tailFiles.get(inode);
         if (tf == null || !tf.getPath().equals(f.getAbsolutePath())) {
           long startPos = skipToEnd ? f.length() : 0;
           tf = openFile(f, headers, inode, startPos);
         } else {
+          //getLastUpdated方法会随着后续process不断更新，tf.getLastUpdated是文件上一次被监控的时间
+          //lastModified为文件最后一次被修改的时间
+          //如果文件的修改时间大于上一次被监控的时间，自然文件就更新了，也就需要监控其更新部分
           boolean updated = tf.getLastUpdated() < f.lastModified() || tf.getPos() != f.length();
+          //判断是否监控其更新部分
           if (updated) {
             if (tf.getRaf() == null) {
               tf = openFile(f, headers, inode, tf.getPos());
@@ -281,6 +338,7 @@ public class ReliableTaildirEventReader implements ReliableEventReader {
           }
           tf.setNeedTail(updated);
         }
+        //更新tailFiles
         tailFiles.put(inode, tf);
         updatedInodes.add(inode);
       }

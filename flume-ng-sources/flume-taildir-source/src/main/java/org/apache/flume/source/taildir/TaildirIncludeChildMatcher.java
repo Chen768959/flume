@@ -63,6 +63,13 @@ import java.util.regex.Pattern;
  * for both {@code System.currentTimeMillis()} and {@code File.lastModified()}. Also
  * that system clock is used for file system timestamps. If it is not the case then configure it
  * as uncached. Class is solely for package only usage. Member functions are not thread safe.
+ *
+ * 该Matcher提供监控子目录的能力。
+ * 配置文件中使用filegroupsIncludeChild参数配置父目录后，会自动监控其下所有子目录中是否有符合正则的文件，
+ * 当出现新增的子目录时也会一并监控。
+ * 当前类也和{@link TailMatcher}一样拥有缓存机制，即只有当确定目录更新了后，才会全量扫描文件，
+ * 且由于包含子目录，所有的子目录也都会缓存，当发现某个子目录出现更改时，会单独全量扫描该子目录的文件，
+ * 而其他未发生更改的目录，则不会被全面扫描，还是使用的缓存文件列表。
  */
 @InterfaceAudience.Private
 @InterfaceStability.Evolving

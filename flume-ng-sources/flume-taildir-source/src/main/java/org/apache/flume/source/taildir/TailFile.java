@@ -135,11 +135,18 @@ public class TailFile {
     oldBuffer = new byte[0];
   }
 
-
+  /**
+   * 一次读取的event数量，由batchSize决定
+   * backoffWithoutNL是true，
+   */
   public List<Event> readEvents(int numEvents, boolean backoffWithoutNL,
       boolean addByteOffset) throws IOException {
     List<Event> events = Lists.newLinkedList();
+    //循环numEvents次，每次读取一个event对象
     for (int i = 0; i < numEvents; i++) {
+      /**
+       * 将数据转化为byte数组，将文件的读取位置，和byte数组装入event并返回
+       */
       Event event = readEvent(backoffWithoutNL, addByteOffset);
       if (event == null) {
         break;
@@ -150,19 +157,24 @@ public class TailFile {
   }
 
   private Event readEvent(boolean backoffWithoutNL, boolean addByteOffset) throws IOException {
+    //读取的初始位置
     Long posTmp = getLineReadPos();
+    //按字节读取数据, 根据换行符, 截取一行数据, 返回二进制数据.
     LineResult line = readLine();
     if (line == null) {
       return null;
     }
+    //如果没有新行，则返回null
     if (backoffWithoutNL && !line.lineSepInclude) {
       logger.info("Backing off in file without newline: "
           + path + ", inode: " + inode + ", pos: " + raf.getFilePointer());
       updateFilePos(posTmp);
       return null;
     }
+    //就是把line.line的byte数组，放入event
     Event event = EventBuilder.withBody(line.line);
     if (addByteOffset == true) {
+      //填充event头部，装入键值对“byteoffset:posTmp”（body的类型为byte类型，且读的文件位置为posTmp）
       event.getHeaders().put(BYTE_OFFSET_HEADER_KEY, posTmp.toString());
     }
     return event;
@@ -189,6 +201,7 @@ public class TailFile {
   public LineResult readLine() throws IOException {
     LineResult lineResult = null;
     while (true) {
+      //bufferPos默认为NEED_READING
       if (bufferPos == NEED_READING) {
         if (raf.getFilePointer() < raf.length()) {
           readFile();
